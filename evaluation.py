@@ -14,13 +14,13 @@ from benchmark_schema import build_answer_list, load_benchmark_records, load_ima
 
 print("Loading Qwen")
 qwen_processor = AutoProcessor.from_pretrained(
-    "Qwen/Qwen3-VL-8B-Instruct",
+    "/mnt/afs/zhengmingkai/zyr/GenEval2-Yiran/Qwen3-VL-8B-Instruct",
     torch_dtype="auto",
     device_map="auto",
 )
 
 qwen_model = Qwen3VLForConditionalGeneration.from_pretrained(
-    "Qwen/Qwen3-VL-8B-Instruct",
+    "/mnt/afs/zhengmingkai/zyr/GenEval2-Yiran/Qwen3-VL-8B-Instruct",
     dtype="auto",
     device_map="auto",
 )
