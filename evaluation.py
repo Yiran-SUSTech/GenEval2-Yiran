@@ -101,11 +101,34 @@ def is_retryable_error(e):
     return not any(keyword in error_str for keyword in non_retryable)
 
 
+def is_fatal_config_error(e):
+    """Auth or request-parameter errors that would fail identically on every call."""
+    error_str = str(e).lower()
+    fatal_keywords = [
+        "invalid_api_key",
+        "authentication",
+        "unauthorized",
+        "invalid_parameter",
+        "range of top_logprobs",
+        "'top_logprobs'",
+    ]
+    return any(keyword in error_str for keyword in fatal_keywords)
+
+
 def answer_prob_from_logprobs(top_logprobs, answer_list):
-    """Sum probabilities of answer-variant tokens among the top-k token logprobs."""
+    """Sum probabilities of answer-variant tokens among the top-k token logprobs.
+
+    Matching tolerates casing/whitespace differences between the variant strings
+    and the tokenizer's token texts (e.g. token "YES" vs variant "Yes").
+    """
     wanted = set(answer_list)
-    prob_by_token = {lp.token: math.exp(lp.logprob) for lp in top_logprobs or []}
-    return sum(prob for token, prob in prob_by_token.items() if token in wanted)
+    wanted_norm = {variant.strip().lower() for variant in answer_list}
+    total = 0.0
+    for lp in top_logprobs or []:
+        token = lp.token
+        if token in wanted or token.strip().lower() in wanted_norm:
+            total += math.exp(lp.logprob)
+    return total
 
 
 class APIVQAJudge:
@@ -137,6 +160,11 @@ class APIVQAJudge:
             except Exception as e:
                 last_exception = e
                 if not is_retryable_error(e):
+                    if is_fatal_config_error(e):
+                        raise SystemExit(
+                            "Fatal API configuration error (aborting — every call would fail): "
+                            f"{e}"
+                        )
                     raise
                 if attempt < self.max_retries:
                     delay = self.retry_delay * (2**attempt)
@@ -367,8 +395,8 @@ def main():
         "--top_logprobs",
         type=int,
         required=False,
-        default=20,
-        help="Number of top token logprobs to request when scoring via API",
+        default=5,
+        help="Number of top token logprobs to request when scoring via API (DashScope allows at most 5)",
     )
     parser.add_argument(
         "--max_retries",
