@@ -1,0 +1,129 @@
+{
+  "method": "soft_tifa_gm",
+  "vqa_backend": "api",
+  "vqa_model": "qwen3.6-plus",
+  "summary": {
+    "overall_am": 99.86030528902342,
+    "overall_gm": 99.86017185846244,
+    "task_summaries": {
+      "t2i": {
+        "sample_count": 3,
+        "am": 99.86030528902342,
+        "gm": 99.86017185846244
+      }
+    },
+    "joint_task_macro_avg": 99.86017185846244
+  },
+  "results": [
+    {
+      "sample_id": "t2i_000000",
+      "task_type": "t2i",
+      "prompt": "a green backpack and a pig",
+      "condition": {
+        "type": "text",
+        "text": "a green backpack and a pig"
+      },
+      "metadata": {
+        "atom_count": 3,
+        "skills": [
+          "count",
+          "attribute",
+          "object",
+          "count",
+          "object"
+        ]
+      },
+      "atom_questions": [
+        "How many backpacks are in the image?",
+        "Is the backpack green?",
+        "Are there any backpacks in the image?",
+        "How many pigs are in the image?",
+        "Are there any pigs in the image?"
+      ],
+      "atom_skills": [
+        "count",
+        "attribute",
+        "object",
+        "count",
+        "object"
+      ],
+      "atom_scores": [
+        0.9999983488489221,
+        0.999999825753575,
+        0.9996762965208601,
+        0.9999993100335491,
+        0.999960168511284
+      ],
+      "sample_am": 0.9999267899336379,
+      "sample_gm": 0.9999267819745703
+    },
+    {
+      "sample_id": "t2i_000001",
+      "task_type": "t2i",
+      "prompt": "seven green croissants",
+      "condition": {
+        "type": "text",
+        "text": "seven green croissants"
+      },
+      "metadata": {
+        "atom_count": 3,
+        "skills": [
+          "count",
+          "attribute",
+          "object"
+        ]
+      },
+      "atom_questions": [
+        "How many croissants are in the image?",
+        "Are the croissants green?",
+        "Are there any croissants in the image?"
+      ],
+      "atom_skills": [
+        "count",
+        "attribute",
+        "object"
+      ],
+      "atom_scores": [
+        0.993281591636235,
+        0.9999955433078679,
+        0.9954833993375939
+      ],
+      "sample_am": 0.9962535114272323,
+      "sample_gm": 0.9962495949071631
+    },
+    {
+      "sample_id": "t2i_000002",
+      "task_type": "t2i",
+      "prompt": "two metal toys",
+      "condition": {
+        "type": "text",
+        "text": "two metal toys"
+      },
+      "metadata": {
+        "atom_count": 3,
+        "skills": [
+          "count",
+          "attribute",
+          "object"
+        ]
+      },
+      "atom_questions": [
+        "How many toys are in the image?",
+        "Are the toys metal?",
+        "Are there any toys in the image?"
+      ],
+      "atom_skills": [
+        "count",
+        "attribute",
+        "object"
+      ],
+      "atom_scores": [
+        0.9999853511471624,
+        0.9998246040855195,
+        0.9990766166968159
+      ],
+      "sample_am": 0.9996288573098325,
+      "sample_gm": 0.9996287788721394
+    }
+  ]
+}
