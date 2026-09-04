@@ -6,12 +6,15 @@ import json
 import math
 import mimetypes
 import os
+import re
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from statistics import mean
 from threading import Lock
 
+from PIL import Image
 from tqdm import tqdm
 from scipy.stats import gmean
 
@@ -20,6 +23,12 @@ from benchmark_schema import build_answer_list, load_benchmark_records, load_ima
 DEFAULT_LOCAL_MODEL = "Qwen/Qwen3-VL-8B-Instruct"
 DEFAULT_API_MODEL = "qwen3.6-plus"
 DEFAULT_API_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+ABORT_REJECT_THRESHOLD = 30
+
+
+class ImageRejectedError(Exception):
+    """The VQA judge cannot score this particular image (corrupt/unsupported file or content filter)."""
 
 
 class LocalVQAJudge:
@@ -42,6 +51,13 @@ class LocalVQAJudge:
             dtype="auto",
             device_map="auto",
         )
+
+    def begin_sample(self):
+        pass
+
+    @property
+    def sample_failures(self):
+        return 0
 
     def send_message_with_image(self, prompt, image_filepath, answer_list=None):
         messages = [
@@ -83,36 +99,58 @@ class LocalVQAJudge:
         return argmax_token.strip(), lm_prob
 
 
+def _normalized_error_text(e):
+    return re.sub(r"[^a-z0-9]", "", str(e).lower())
+
+
 def is_retryable_error(e):
     status_code = getattr(getattr(e, "response", None), "status_code", None)
     if status_code in (400, 401, 403, 422):
         return False
-    error_str = str(e).lower()
+    error_str = _normalized_error_text(e)
     non_retryable = [
         "datainspectionfailed",
-        "data inspection failed",
-        "content_filter",
-        "content filter",
-        "inappropriate content",
-        "invalid_api_key",
+        "contentfilter",
+        "inappropriatecontent",
+        "invalidapikey",
         "authentication",
-        "invalid request",
+        "invalidrequest",
     ]
     return not any(keyword in error_str for keyword in non_retryable)
 
 
 def is_fatal_config_error(e):
-    """Auth or request-parameter errors that would fail identically on every call."""
-    error_str = str(e).lower()
+    """Errors that would fail identically on every call (auth, request parameters, quota)."""
+    error_str = _normalized_error_text(e)
     fatal_keywords = [
-        "invalid_api_key",
+        "invalidapikey",
         "authentication",
         "unauthorized",
-        "invalid_parameter",
-        "range of top_logprobs",
-        "'top_logprobs'",
+        "modelfound",
+        "modelnotfound",
+        "modelnotexist",
+        "rangeoftoplogprobs",
+        "toplogprobs",
+        "insufficientbalance",
+        "arrears",
     ]
     return any(keyword in error_str for keyword in fatal_keywords)
+
+
+def is_image_rejection(e):
+    """Errors where the API rejects this particular image (bad payload or content filter)."""
+    error_str = _normalized_error_text(e)
+    rejection_keywords = [
+        "urldoesnotappeartobevalid",
+        "invalidimage",
+        "notavalidimage",
+        "imageisinvalid",
+        "failedtodecode",
+        "datainspectionfailed",
+        "contentfilter",
+        "inappropriatecontent",
+    ]
+    return any(keyword in error_str for keyword in rejection_keywords)
 
 
 def answer_prob_from_logprobs(top_logprobs, answer_list):
@@ -138,7 +176,7 @@ class APIVQAJudge:
     generates one token and asks for its top-k logprobs.
     """
 
-    def __init__(self, model_name, api_base, api_key, top_logprobs=20, max_retries=5, retry_delay=2.0):
+    def __init__(self, model_name, api_base, api_key, top_logprobs=5, max_retries=5, retry_delay=2.0):
         from openai import OpenAI
 
         if not api_key:
@@ -148,9 +186,32 @@ class APIVQAJudge:
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.failed_calls = 0
+        self.consecutive_rejects = 0
+        self.abort_reject_threshold = ABORT_REJECT_THRESHOLD
         self._lock = Lock()
+        self._local = threading.local()
         self.client = OpenAI(api_key=api_key, base_url=api_base)
         print(f"Using API VQA model: {model_name} @ {api_base}")
+
+    def begin_sample(self):
+        self._local.sample_failures = 0
+
+    @property
+    def sample_failures(self):
+        return getattr(self._local, "sample_failures", 0)
+
+    def _register_hard_failure(self):
+        with self._lock:
+            self.failed_calls += 1
+            self.consecutive_rejects += 1
+            should_abort = self.consecutive_rejects >= self.abort_reject_threshold
+        self._local.sample_failures = getattr(self._local, "sample_failures", 0) + 1
+        if should_abort:
+            raise SystemExit(
+                f"Aborting: {self.consecutive_rejects} consecutive failed/rejected API calls. "
+                "Isolated broken images are skipped automatically, so this many in a row points to a "
+                "systematic problem (all images unreadable, an API-side change, or account quota)."
+            )
 
     def _create_with_retry(self, **kwargs):
         last_exception = None
@@ -199,10 +260,17 @@ class APIVQAJudge:
                 extra_body={"enable_thinking": False},
             )
         except Exception as e:
-            with self._lock:
-                self.failed_calls += 1
+            if is_image_rejection(e):
+                self._register_hard_failure()
+                raise ImageRejectedError(
+                    f"VQA API rejected the image {image_filepath}: {type(e).__name__}: {e}"
+                ) from e
+            self._register_hard_failure()
             print(f"  [WARN] VQA API call failed for {image_filepath}: {type(e).__name__}: {e}; scoring as 0")
             return "", 0.0
+
+        with self._lock:
+            self.consecutive_rejects = 0
 
         choice = completion.choices[0]
         pred = (choice.message.content or "").strip()
@@ -221,12 +289,18 @@ class APIVQAJudge:
         return pred, answer_prob_from_logprobs(top_logprobs, answer_list)
 
 
+def resolve_vqa_model_name(args):
+    if args.vqa_backend == "local":
+        return args.vqa_model or DEFAULT_LOCAL_MODEL
+    return args.vqa_model or DEFAULT_API_MODEL
+
+
 def build_judge(args):
     if args.vqa_backend == "local":
-        return LocalVQAJudge(args.vqa_model or DEFAULT_LOCAL_MODEL)
+        return LocalVQAJudge(resolve_vqa_model_name(args))
     api_key = args.api_key or os.environ.get("DASHSCOPE_API_KEY", "")
     return APIVQAJudge(
-        args.vqa_model or DEFAULT_API_MODEL,
+        resolve_vqa_model_name(args),
         api_base=args.api_base,
         api_key=api_key,
         top_logprobs=args.top_logprobs,
@@ -339,6 +413,79 @@ def score_record(judge, record, image_manifest, method):
     }
 
 
+def describe_image(image_path):
+    try:
+        size_mb = Path(image_path).stat().st_size / 1e6
+        with Image.open(image_path) as image:
+            return f"file_size={size_mb:.2f}MB format={image.format} dimensions={image.size} mode={image.mode}"
+    except Exception as e:
+        return f"unreadable by PIL: {type(e).__name__}: {e}"
+
+
+def image_path_or_none(record, image_data):
+    try:
+        return resolve_image_path(record, image_data)
+    except KeyError:
+        return None
+
+
+def preflight_images(records, image_data):
+    """Decode every image before spending API budget; unreadable ones are skipped and reported."""
+    broken = {}
+    for record in tqdm(records, desc="Pre-flight", unit="img"):
+        try:
+            image_path = resolve_image_path(record, image_data)
+        except KeyError as e:
+            broken[record["sample_id"]] = f"missing from image manifest: {e}"
+            continue
+        if not Path(image_path).is_file():
+            broken[record["sample_id"]] = f"image file not found: {image_path}"
+            continue
+        try:
+            with Image.open(image_path) as image:
+                image.load()
+        except Exception as e:
+            broken[record["sample_id"]] = f"unreadable image: {type(e).__name__}: {e}"
+    return broken
+
+
+def load_checkpoint(partial_path, args, vqa_model_name):
+    """Load {sample_id: result} from the checkpoint of a previous interrupted run."""
+    with open(partial_path, "r", encoding="utf-8") as handle:
+        lines = handle.readlines()
+    if not lines:
+        return {}
+    try:
+        header = json.loads(lines[0])
+    except json.JSONDecodeError:
+        raise SystemExit(f"Corrupt checkpoint file: {partial_path} — delete it and rerun.")
+    expected = {
+        "method": args.method,
+        "vqa_backend": args.vqa_backend,
+        "vqa_model": vqa_model_name,
+        "benchmark": args.benchmark_data,
+        "image_manifest": args.image_filepath_data,
+    }
+    for key, value in expected.items():
+        if header.get(key) != value:
+            raise SystemExit(
+                f"Checkpoint {partial_path} was written for {key}={header.get(key)!r}, but this run uses "
+                f"{value!r}. Use a different --output_file or delete {partial_path} to start fresh."
+            )
+    checkpointed = {}
+    for line in lines[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            result = json.loads(line)
+        except json.JSONDecodeError:
+            print("[WARN] Skipped one corrupt checkpoint line (interrupted write)")
+            continue
+        checkpointed[result["sample_id"]] = result
+    return checkpointed
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate T2I or C2I images with Soft-TIFA")
     parser.add_argument("--benchmark_data", type=str, required=True, help="Path to benchmark data")
@@ -350,7 +497,13 @@ def main():
         choices=["vqascore", "tifa", "soft_tifa_am", "soft_tifa_gm"],
         help="Method name",
     )
-    parser.add_argument("--output_file", type=str, required=True, help="Output JSON filepath")
+    parser.add_argument(
+        "--output_file",
+        type=str,
+        required=True,
+        help="Output JSON filepath; an interrupted run can be resumed by rerunning the same command "
+        "(checkpoint kept at <output>.partial.jsonl)",
+    )
     parser.add_argument(
         "--legacy_output_file",
         type=str,
@@ -423,6 +576,16 @@ def main():
 
     benchmark_data = load_benchmark_records(args.benchmark_data)
     image_data = load_image_manifest(args.image_filepath_data)
+
+    vqa_model_name = resolve_vqa_model_name(args)
+    partial_path = Path(args.output_file).with_suffix(".partial.jsonl")
+
+    checkpointed = {}
+    if partial_path.exists():
+        checkpointed = load_checkpoint(partial_path, args, vqa_model_name)
+        if checkpointed:
+            print(f"Resuming: {len(checkpointed)} scored sample(s) loaded from {partial_path}")
+
     judge = build_judge(args)
 
     concurrency = args.concurrency
@@ -430,14 +593,91 @@ def main():
         print("[WARN] --concurrency > 1 is only supported with --vqa_backend api; running sequentially")
         concurrency = 1
 
-    def worker(record):
-        return score_record(judge, record, image_data, args.method)
+    todo_records = [record for record in benchmark_data if record["sample_id"] not in checkpointed]
+    broken = preflight_images(todo_records, image_data)
+    if broken:
+        print(f"[WARN] {len(broken)} image(s) unreadable; they will be skipped and reported in failed_samples:")
+        for sample_id, reason in list(broken.items())[:10]:
+            print(f"  - {sample_id}: {reason}")
+        if len(broken) > 10:
+            print(f"  ... and {len(broken) - 10} more")
+    todo = [record for record in todo_records if record["sample_id"] not in broken]
 
-    if concurrency > 1:
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            results = list(tqdm(pool.map(worker, benchmark_data), total=len(benchmark_data), desc="Evaluating"))
+    failed_samples = []
+    for record in todo_records:
+        if record["sample_id"] in broken:
+            image_path = image_path_or_none(record, image_data)
+            failed_samples.append(
+                {
+                    "sample_id": record["sample_id"],
+                    "image": image_path,
+                    "error": broken[record["sample_id"]],
+                    "diagnostics": describe_image(image_path) if image_path else "no image path",
+                    "stage": "preflight",
+                }
+            )
+
+    is_fresh_checkpoint = not partial_path.exists()
+    partial_handle = open(partial_path, "a", encoding="utf-8")
+    if is_fresh_checkpoint:
+        partial_handle.write(
+            json.dumps(
+                {
+                    "method": args.method,
+                    "vqa_backend": args.vqa_backend,
+                    "vqa_model": vqa_model_name,
+                    "benchmark": args.benchmark_data,
+                    "image_manifest": args.image_filepath_data,
+                }
+            )
+            + "\n"
+        )
+
+    def worker(record):
+        judge.begin_sample()
+        try:
+            result = score_record(judge, record, image_data, args.method)
+        except ImageRejectedError as e:
+            return record, None, str(e), False
+        return record, result, None, judge.sample_failures == 0
+
+    results_by_id = dict(checkpointed)
+
+    if todo:
+        executor = ThreadPoolExecutor(max_workers=concurrency)
+        futures = [executor.submit(worker, record) for record in todo]
+        try:
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Evaluating"):
+                record, result, rejection, clean = future.result()
+                if rejection is not None:
+                    image_path = image_path_or_none(record, image_data)
+                    entry = {
+                        "sample_id": record["sample_id"],
+                        "image": image_path,
+                        "error": rejection,
+                        "diagnostics": describe_image(image_path) if image_path else "no image path",
+                        "stage": "runtime",
+                    }
+                    failed_samples.append(entry)
+                    print(f"  [SKIP] VQA API rejected the image (sample {record['sample_id']}): {image_path}")
+                    print(f"         {rejection}")
+                    print(f"         {entry['diagnostics']}")
+                    continue
+                results_by_id[record["sample_id"]] = result
+                if clean:
+                    partial_handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+                    partial_handle.flush()
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+            partial_handle.close()
     else:
-        results = [worker(record) for record in tqdm(benchmark_data, desc="Evaluating")]
+        partial_handle.close()
+
+    results = [
+        results_by_id[record["sample_id"]]
+        for record in benchmark_data
+        if record["sample_id"] in results_by_id
+    ]
 
     summary = summarize_results(results)
     output = {
@@ -445,6 +685,8 @@ def main():
         "vqa_backend": args.vqa_backend,
         "vqa_model": judge.model_name,
         "summary": summary,
+        "scored_samples": len(results),
+        "failed_samples": failed_samples,
         "results": results,
     }
     failed_calls = getattr(judge, "failed_calls", 0)
@@ -457,6 +699,13 @@ def main():
     with open(legacy_output_file, "w", encoding="utf-8") as handle:
         json.dump(legacy_score_lists(results), handle)
 
+    partial_path.unlink(missing_ok=True)
+
+    if failed_samples:
+        print(
+            f"[WARN] {len(failed_samples)} image(s) could not be scored and are excluded from the summary "
+            f"— see 'failed_samples' in {args.output_file}"
+        )
     if failed_calls:
         print(f"[WARN] {failed_calls} API call(s) failed after retries and were scored as 0")
 
@@ -465,6 +714,9 @@ def main():
     else:
         total_score = summary["overall_am"]
     print(f"Score: {total_score}")
+
+    if not results:
+        raise SystemExit("No samples were scored — check the warnings above and 'failed_samples' in the output file.")
 
 
 if __name__ == "__main__":
