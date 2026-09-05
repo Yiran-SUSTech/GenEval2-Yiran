@@ -56,7 +56,13 @@ class GenerationError(Exception):
 
 def is_fatal_error(text):
     compact = re.sub(r"[^a-z0-9]", "", text.lower())
-    return any(keyword in compact for keyword in FATAL_KEYWORDS)
+    if any(keyword in compact for keyword in FATAL_KEYWORDS):
+        return True
+    # Billing / daily-quota exhaustion ("You exceeded your current quota, please check your plan
+    # and billing details"). Unlike per-minute rate limits, waiting 10s cannot fix these, so abort.
+    if "exceededyourcurrentquota" in compact or "checkyourplanandbilling" in compact:
+        return "perminute" not in compact
+    return False
 
 
 class RateLimitCooldown:
@@ -95,7 +101,7 @@ def post_json(url, headers, payload, timeout, max_retries, retry_delay, cooldown
         else:
             if resp.status_code == 200:
                 return resp.json()
-            body = resp.text[:500]
+            body = resp.text[:1000]
             if is_fatal_error(body):
                 raise FatalAPIError(f"HTTP {resp.status_code}: {body}")
             if resp.status_code == 429:
