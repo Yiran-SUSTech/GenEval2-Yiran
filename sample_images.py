@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
@@ -58,25 +59,58 @@ def is_fatal_error(text):
     return any(keyword in compact for keyword in FATAL_KEYWORDS)
 
 
-def post_json(url, headers, payload, timeout, max_retries, retry_delay):
+class RateLimitCooldown:
+    """After the first HTTP 429, pause before every request for the rest of the run."""
+
+    def __init__(self, wait_seconds):
+        self.wait_seconds = wait_seconds
+        self._active = False
+        self._lock = threading.Lock()
+
+    @property
+    def active(self):
+        return self._active
+
+    def trigger(self):
+        with self._lock:
+            if not self._active:
+                self._active = True
+                print(f"  [THROTTLE] Rate limit hit — pausing {self.wait_seconds:.1f}s before every request from now on")
+
+    def wait_if_active(self):
+        if self._active:
+            time.sleep(self.wait_seconds)
+
+
+def post_json(url, headers, payload, timeout, max_retries, retry_delay, cooldown=None):
     last_error = ""
     for attempt in range(max_retries + 1):
+        if attempt == 0 and cooldown is not None:
+            cooldown.wait_if_active()
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
         except requests.RequestException as e:
             last_error = f"network error: {type(e).__name__}: {e}"
+            delay = retry_delay * (2**attempt)
         else:
             if resp.status_code == 200:
                 return resp.json()
             body = resp.text[:500]
             if is_fatal_error(body):
                 raise FatalAPIError(f"HTTP {resp.status_code}: {body}")
-            if resp.status_code == 429 or resp.status_code >= 500:
+            if resp.status_code == 429:
+                if cooldown is not None:
+                    cooldown.trigger()
+                    delay = cooldown.wait_seconds
+                else:
+                    delay = retry_delay * (2**attempt)
+                last_error = f"HTTP 429: {body}"
+            elif resp.status_code >= 500:
                 last_error = f"HTTP {resp.status_code}: {body}"
+                delay = retry_delay * (2**attempt)
             else:
                 raise GenerationError(f"HTTP {resp.status_code}: {body}")
         if attempt < max_retries:
-            delay = retry_delay * (2**attempt)
             print(f"  [RETRY] {last_error} — retrying in {delay:.1f}s")
             time.sleep(delay)
     raise GenerationError(last_error)
@@ -131,6 +165,7 @@ class MiniMaxBackend:
             self.args.timeout,
             self.args.max_retries,
             self.args.retry_delay,
+            cooldown=self.args.cooldown,
         )
         status = data.get("base_resp", {})
         if status.get("status_code", 0) != 0:
@@ -168,6 +203,7 @@ class QwenBackend:
             self.args.timeout,
             self.args.max_retries,
             self.args.retry_delay,
+            cooldown=self.args.cooldown,
         )
         if data.get("code"):
             raise GenerationError(f"Qwen error {data.get('code')}: {data.get('message')}")
@@ -209,6 +245,7 @@ class GeminiBackend:
             self.args.timeout,
             self.args.max_retries,
             self.args.retry_delay,
+            cooldown=self.args.cooldown,
         )
         block_reason = (data.get("promptFeedback") or {}).get("blockReason")
         if block_reason:
@@ -255,6 +292,8 @@ def main():
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--max_retries", type=int, default=5)
     parser.add_argument("--retry_delay", type=float, default=2.0)
+    parser.add_argument("--rate_limit_wait", type=float, default=10.0,
+                        help="Seconds to wait after an HTTP 429, and before every following request once throttled")
     parser.add_argument("--timeout", type=int, default=300, help="Per-request timeout in seconds")
     parser.add_argument("--limit", type=int, default=None, help="Only sample the first N missing prompts (smoke test)")
     args = parser.parse_args()
@@ -262,6 +301,7 @@ def main():
     defaults = BACKEND_DEFAULTS[args.backend]
     args.model = args.model or defaults["model"]
     args.base_url = args.base_url or defaults["base_url"]
+    args.cooldown = RateLimitCooldown(args.rate_limit_wait)
     api_key = args.api_key or os.environ.get(defaults["api_key_env"], "")
     if not api_key:
         raise SystemExit(f"API key missing: pass --api_key or set {defaults['api_key_env']}")
