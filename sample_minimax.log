@@ -1,5 +1,4 @@
 Backend: minimax | model: image-01
-Prompts: 800 | already sampled: 796 | to sample: 4
-Sampling:   0%|          | 0/4 [00:00<?, ?it/s]Sampling:  25%|██▌       | 1/4 [00:17<00:52, 17.59s/it]Sampling:  50%|█████     | 2/4 [00:33<00:33, 16.87s/it]Sampling:  75%|███████▌  | 3/4 [00:34<00:09,  9.30s/it]Sampling: 100%|██████████| 4/4 [00:51<00:00, 12.50s/it]Sampling: 100%|██████████| 4/4 [00:51<00:00, 12.91s/it]
-Done: 3 generated, 1 failed, 796 previously existing
-Failures saved to /mnt/afs/zhengmingkai/zyr/GenEval2-Yiran/geneval2_minimax_image01/failed_samples.json — rerun the same command to retry only missing images
+Prompts: 800 | already sampled: 799 | to sample: 1
+Sampling:   0%|          | 0/1 [00:00<?, ?it/s]Sampling: 100%|██████████| 1/1 [00:16<00:00, 16.53s/it]Sampling: 100%|██████████| 1/1 [00:16<00:00, 16.53s/it]
+Done: 1 generated, 0 failed, 799 previously existing
