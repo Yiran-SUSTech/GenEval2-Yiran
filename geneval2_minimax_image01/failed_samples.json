@@ -1,0 +1,27 @@
+[
+  {
+    "index": 359,
+    "prompt": "three yellow monkeys on top of a green clock",
+    "error": "MiniMax error 1026: input new_sensitive"
+  },
+  {
+    "index": 411,
+    "prompt": "a yellow bear and six yellow penguins and three giraffes",
+    "error": "MiniMax error 1026: input new_sensitive"
+  },
+  {
+    "index": 424,
+    "prompt": "two birds, and a suitcase in front of four yellow monkeys",
+    "error": "MiniMax error 1026: input new_sensitive"
+  },
+  {
+    "index": 689,
+    "prompt": "seven yellow umbrellas under three mushrooms under a red giraffe",
+    "error": "MiniMax error 1026: input new_sensitive"
+  },
+  {
+    "index": 719,
+    "prompt": "three metal suitcases, and seven black koalas under three pink motorcycles",
+    "error": "MiniMax error 1033: system error"
+  }
+]
