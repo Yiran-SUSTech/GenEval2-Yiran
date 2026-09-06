@@ -1,0 +1,23 @@
+Summary
+overall_am: 70.18
+overall_gm: 22.61
+joint_task_macro_avg: 22.61
+
+T2I Analysis
+Per Atom Type Analysis (Soft-TIFA AM)
+count: 51.34
+attribute: 71.54
+object: 92.97
+position: 45.47
+verb: 23.24
+
+Per Atomicity Analysis (Soft-TIFA GM)
+Atomicity=3: 55.46
+Atomicity=4: 42.27
+Atomicity=5: 27.01
+Atomicity=6: 20.52
+Atomicity=7: 14.46
+Atomicity=8: 11.14
+Atomicity=9: 5.98
+Atomicity=10: 4.04
+
