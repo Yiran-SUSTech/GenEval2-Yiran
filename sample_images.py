@@ -31,6 +31,11 @@ BACKEND_DEFAULTS = {
         "base_url": "https://generativelanguage.googleapis.com/v1beta",
         "api_key_env": "GEMINI_API_KEY",
     },
+    "openrouter": {
+        "model": "google/gemini-3.1-flash-image",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key_env": "OPENROUTER_API_KEY",
+    },
 }
 
 FATAL_KEYWORDS = [
@@ -62,6 +67,9 @@ def is_fatal_error(text):
     # and billing details"). Unlike per-minute rate limits, waiting 10s cannot fix these, so abort.
     if "exceededyourcurrentquota" in compact or "checkyourplanandbilling" in compact:
         return "perminute" not in compact
+    # OpenRouter: out of prepaid credits — every request would fail identically.
+    if "insufficientcredits" in compact or "insufficientbalance" in compact:
+        return True
     return False
 
 
@@ -102,6 +110,8 @@ def post_json(url, headers, payload, timeout, max_retries, retry_delay, cooldown
             if resp.status_code == 200:
                 return resp.json()
             body = resp.text[:1000]
+            if resp.status_code in (401, 403):
+                raise FatalAPIError(f"HTTP {resp.status_code}: {body}")
             if is_fatal_error(body):
                 raise FatalAPIError(f"HTTP {resp.status_code}: {body}")
             if resp.status_code == 429:
@@ -266,7 +276,63 @@ class GeminiBackend:
         raise GenerationError(f"no image part in response (finishReason={candidates[0].get('finishReason')})")
 
 
-BACKENDS = {"minimax": MiniMaxBackend, "qwen": QwenBackend, "gemini": GeminiBackend}
+class OpenRouterBackend:
+    """OpenRouter dedicated Images API: POST {base_url}/images, returns data[0].b64_json."""
+
+    OPTIONAL_FIELDS = ("aspect_ratio", "resolution")
+
+    def __init__(self, args, api_key):
+        self.model = args.model
+        self.base_url = args.base_url.rstrip("/")
+        self.aspect_ratio = args.aspect_ratio
+        self.resolution = args.image_size
+        self.headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        self.args = args
+        self.enabled_fields = set(self.OPTIONAL_FIELDS)
+
+    def generate(self, prompt):
+        payload = {"model": self.model, "prompt": prompt}
+        if "aspect_ratio" in self.enabled_fields:
+            payload["aspect_ratio"] = self.aspect_ratio
+        if "resolution" in self.enabled_fields:
+            payload["resolution"] = self.resolution
+        while True:
+            try:
+                data = post_json(
+                    f"{self.base_url}/images",
+                    self.headers,
+                    payload,
+                    self.args.timeout,
+                    self.args.max_retries,
+                    self.args.retry_delay,
+                    cooldown=self.args.cooldown,
+                )
+                break
+            except GenerationError as e:
+                field = self._rejected_field(str(e))
+                if field is None:
+                    raise
+                print(f"  [NOTE] endpoint rejected '{field}' — retrying without it (disabled for the rest of the run)")
+                self.enabled_fields.discard(field)
+                payload.pop(field, None)
+        images = data.get("data") or []
+        if not images or not images[0].get("b64_json"):
+            detail = data.get("error") or "empty response (content filter?)"
+            raise GenerationError(f"OpenRouter returned no image: {detail}")
+        return base64.b64decode(images[0]["b64_json"])
+
+    def _rejected_field(self, message):
+        compact = re.sub(r"[^a-z0-9]", "", message.lower())
+        if not re.search(r"unsupported|notsupport|unknown|unrecognized|invalid|unexpected", compact):
+            return None
+        for field in self.OPTIONAL_FIELDS:
+            if field in self.enabled_fields and re.sub(r"[^a-z0-9]", "", field) in compact:
+                return field
+        return None
+
+
+BACKENDS = {"minimax": MiniMaxBackend, "qwen": QwenBackend, "gemini": GeminiBackend,
+            "openrouter": OpenRouterBackend}
 
 
 def load_prompts(benchmark_path):
@@ -289,9 +355,10 @@ def main():
     parser.add_argument("--model", type=str, default=None, help="Overrides the backend default model")
     parser.add_argument("--api_key", type=str, default=None, help="Overrides the backend default env var")
     parser.add_argument("--base_url", type=str, default=None, help="Overrides the backend default base URL")
-    parser.add_argument("--aspect_ratio", type=str, default="1:1", help="MiniMax / Gemini aspect ratio")
+    parser.add_argument("--aspect_ratio", type=str, default="1:1", help="MiniMax / Gemini / OpenRouter aspect ratio")
     parser.add_argument("--size", type=str, default="1024*1024", help="Qwen resolution W*H ('auto' to omit)")
-    parser.add_argument("--image_size", type=str, default="1K", help="Gemini imageSize: 512 / 1K / 2K / 4K")
+    parser.add_argument("--image_size", type=str, default="1K",
+                        help="Gemini imageSize / OpenRouter resolution: 512 / 1K / 2K / 4K")
     parser.add_argument("--auth_scheme", type=str, default="x-goog-api-key", choices=["x-goog-api-key", "bearer"],
                         help="Gemini auth header style (bearer for OpenAI-style relays)")
     parser.add_argument("--seed", type=int, default=0, help="Seed passed to MiniMax / Qwen (best-effort)")
