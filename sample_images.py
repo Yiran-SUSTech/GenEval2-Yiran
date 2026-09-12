@@ -36,6 +36,11 @@ BACKEND_DEFAULTS = {
         "base_url": "https://openrouter.ai/api/v1",
         "api_key_env": "OPENROUTER_API_KEY",
     },
+    "lumenfall": {
+        "model": "gemini-3.1-flash-image-preview",
+        "base_url": "https://api.lumenfall.ai/openai/v1",
+        "api_key_env": "LUMENFALL_API_KEY",
+    },
 }
 
 FATAL_KEYWORDS = [
@@ -110,7 +115,7 @@ def post_json(url, headers, payload, timeout, max_retries, retry_delay, cooldown
             if resp.status_code == 200:
                 return resp.json()
             body = resp.text[:1000]
-            if resp.status_code in (401, 403):
+            if resp.status_code in (401, 402, 403):
                 raise FatalAPIError(f"HTTP {resp.status_code}: {body}")
             if is_fatal_error(body):
                 raise FatalAPIError(f"HTTP {resp.status_code}: {body}")
@@ -323,7 +328,12 @@ class OpenRouterBackend:
 
     def _rejected_field(self, message):
         compact = re.sub(r"[^a-z0-9]", "", message.lower())
-        if not re.search(r"unsupported|notsupport|unknown|unrecognized|invalid|unexpected", compact):
+        # Only inspect 4xx rejections (post_json prefixes them "HTTP <code>").
+        # Wording varies by provider ("invalid", "unsupported", "not one of the
+        # allowed options", "requires at least N pixels"), so treat any 4xx that
+        # names an optional field as a parameter rejection and drop that field.
+        # Safety/moderation 400s never name these fields, so they still propagate.
+        if not compact.startswith("http4"):
             return None
         for field in self.OPTIONAL_FIELDS:
             if field in self.enabled_fields and re.sub(r"[^a-z0-9]", "", field) in compact:
@@ -331,8 +341,66 @@ class OpenRouterBackend:
         return None
 
 
+class LumenfallBackend:
+    """Lumenfall OpenAI-compatible images API: POST {base_url}/images/generations.
+    Returns either data[0].url (temporary link, downloaded immediately) or b64_json."""
+
+    OPTIONAL_FIELDS = ("size",)
+
+    def __init__(self, args, api_key):
+        self.model = args.model
+        self.base_url = args.base_url.rstrip("/")
+        self.size = args.size.replace("*", "x") if args.size and args.size != "auto" else None
+        self.headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        self.args = args
+        self.enabled_fields = {"size"} if self.size else set()
+
+    def generate(self, prompt):
+        payload = {"model": self.model, "prompt": prompt}
+        if "size" in self.enabled_fields:
+            payload["size"] = self.size
+        while True:
+            try:
+                data = post_json(
+                    f"{self.base_url}/images/generations",
+                    self.headers,
+                    payload,
+                    self.args.timeout,
+                    self.args.max_retries,
+                    self.args.retry_delay,
+                    cooldown=self.args.cooldown,
+                )
+                break
+            except GenerationError as e:
+                field = self._rejected_field(str(e))
+                if field is None:
+                    raise
+                print(f"  [NOTE] endpoint rejected '{field}' — retrying without it (disabled for the rest of the run)")
+                self.enabled_fields.discard(field)
+                payload.pop(field, None)
+        images = data.get("data") or []
+        if not images:
+            detail = data.get("error") or "empty response (content filter?)"
+            raise GenerationError(f"Lumenfall returned no image: {detail}")
+        item = images[0]
+        if item.get("b64_json"):
+            return base64.b64decode(item["b64_json"])
+        if item.get("url"):
+            return download_bytes(item["url"], timeout=self.args.timeout)
+        raise GenerationError(f"no image in response: {list(item.keys())}")
+
+    def _rejected_field(self, message):
+        compact = re.sub(r"[^a-z0-9]", "", message.lower())
+        if not compact.startswith("http4"):
+            return None
+        for field in self.OPTIONAL_FIELDS:
+            if field in self.enabled_fields and field in compact:
+                return field
+        return None
+
+
 BACKENDS = {"minimax": MiniMaxBackend, "qwen": QwenBackend, "gemini": GeminiBackend,
-            "openrouter": OpenRouterBackend}
+            "openrouter": OpenRouterBackend, "lumenfall": LumenfallBackend}
 
 
 def load_prompts(benchmark_path):
